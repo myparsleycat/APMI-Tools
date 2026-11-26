@@ -34,6 +34,16 @@ class ImportOptions:
 
 
 class ExportOptions:
+    field_log: StringProperty(
+        name="Field Frame Analysis Log",
+        description="Match a field capture to the source meshes for full mesh export",
+        subtype="FILE_PATH",
+    )
+    full_mesh: BoolProperty(
+        name="Export Full Mesh",
+        description="Export vertex buffers and skinning data, including custom normals when faces were removed",
+        default=False,
+    )
     dds_folder: StringProperty(
         name="DDS Replacement Folder",
         description="Folder containing replacement DDS files named by the original texture hash",
@@ -57,5 +67,7 @@ def draw_import_options(layout, settings):
 
 
 def draw_export_options(layout, settings):
+    layout.prop(settings, "field_log")
+    layout.prop(settings, "full_mesh")
     layout.prop(settings, "dds_folder")
     layout.prop(settings, "overwrite")

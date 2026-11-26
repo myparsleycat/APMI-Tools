@@ -1,3 +1,4 @@
+from collections import Counter
 from pathlib import Path
 import re
 
@@ -15,10 +16,11 @@ from .mod_export import (
     write_mod,
 )
 from .options import ExportOptions, draw_export_options
+from .skinning_variants import BLEND, add_variants, field_draws
 
 
 BONE_GROUP = re.compile(r"Bone (\d+)")
-BLEND = np.dtype([("weights", "<f4", 4), ("indices", "<u4", 4)])
+NORMAL_ROUND_TRIP_TOLERANCE = 0.002
 
 
 def values_from(data, prop, count, width, dtype=np.float32):
@@ -146,7 +148,76 @@ def position_data(mesh, loops, ids, matrix):
     return output
 
 
-def encode_mesh(obj, depsgraph, component):
+def encode_original_indices(mesh, loops, ids, triangles, matrix, source, blend):
+    vertex_ids = mesh.attributes.get("APMI_VERTEX_ID")
+    if (
+        vertex_ids is None or vertex_ids.domain != "POINT" or vertex_ids.data_type != "INT"
+        or not np.array_equal(matrix, np.eye(4))
+    ):
+        return None
+
+    original_ids = values_from(vertex_ids.data, "value", len(mesh.vertices), 1, np.int32).ravel()
+    source_rows = np.searchsorted(source.vertex_ids, original_ids)
+    if np.any(source_rows == len(source.vertex_ids)) or not np.array_equal(source.vertex_ids[source_rows], original_ids):
+        return None
+
+    indices = original_ids[ids[np.searchsorted(loops, triangles)]]
+    source_indices = source.vertex_ids[source.triangles]
+    unchanged = np.array_equal(indices, source_indices)
+    if not unchanged and Counter(map(tuple, indices)) - Counter(map(tuple, source_indices)):
+        return None
+
+    positions = values_from(mesh.vertices, "co", len(mesh.vertices), 3)
+    if not np.array_equal(game_axes(positions), source.positions[source_rows]):
+        return None
+
+    corner_rows = source_rows[ids]
+    for number in range(3):
+        uv = source.uvs.get(number)
+        layer = texture_coordinates(mesh, number)
+        if (layer is None) != (uv is None) or (layer is not None and not np.array_equal(layer[loops], uv[corner_rows])):
+            return None
+    color = mesh.color_attributes.get("COLOR0")
+    if (color is None) != (source.color is None):
+        return None
+    if color is not None:
+        if color.domain not in {"POINT", "CORNER"}:
+            return None
+        values = values_from(color.data, "color", len(color.data), 4)
+        if not np.array_equal(values[ids if color.domain == "POINT" else loops], source.color[corner_rows]):
+            return None
+
+    weights = np.minimum(source.weights[corner_rows], 1).astype(np.float64)
+    bones = source.bones[corner_rows]
+    active = blend["weights"] > 0
+    matches = (blend["indices"][:, :, None] == bones[:, None, :]) & active[:, :, None]
+    if np.any((weights > 0) & ~matches.any(axis=1)):
+        return None
+    normalized = (matches * weights[:, None, :]).sum(axis=2) / weights.sum(axis=1, keepdims=True)
+    if not np.allclose(blend["weights"], normalized, rtol=1e-6, atol=0):
+        return None
+
+    # Edit Mode deletion can change packed corner normals on surviving faces.
+    if indices.size == source_indices.size:
+        if not mesh.has_custom_normals:
+            return None
+        reference = mesh.copy()
+        try:
+            normals = source.normals[source_rows][:, [0, 2, 1]] * np.array([1, -1, 1], dtype=np.float32)
+            reference.normals_split_custom_set_from_vertices(normals.tolist())
+            actual = values_from(mesh.corner_normals, "vector", len(mesh.loops), 3)
+            expected = values_from(reference.corner_normals, "vector", len(mesh.loops), 3)
+            differences = np.linalg.norm(actual[loops] - expected[loops], axis=1)
+            if not np.all(differences <= NORMAL_ROUND_TRIP_TOLERANCE):
+                return None
+        finally:
+            bpy.data.meshes.remove(reference)
+
+    files = {} if unchanged else {"IB": (indices.astype(np.int64) - source.draw.base).astype("<u4").tobytes()}
+    return MeshBuffers(0, indices.size, files)
+
+
+def encode_mesh(obj, depsgraph, component, source=None):
     if any(modifier.type == "ARMATURE" and modifier.show_viewport for modifier in obj.modifiers):
         raise DumpError("Disable the Armature modifier to export pre-skinning geometry")
     matrix = np.array(obj.matrix_world, dtype=np.float64)
@@ -174,10 +245,14 @@ def encode_mesh(obj, depsgraph, component):
         uv0 = texture_coordinates(mesh, 0)
         if uv0 is None:
             raise DumpError("Missing UV map TEXCOORD0")
+        blend = blend_data(obj, mesh, ids, bone_count)
+        if source is not None:
+            original = encode_original_indices(mesh, loops, ids, triangles, matrix, source, blend)
+            if original is not None:
+                return original
         mesh.calc_tangents(uvmap="TEXCOORD0")
         attributes = attribute_streams(mesh, loops, ids, component.streams, uv0)
         position = position_data(mesh, loops, ids, matrix)
-        blend = blend_data(obj, mesh, ids, bone_count)
     finally:
         evaluated.to_mesh_clear()
 
@@ -209,7 +284,7 @@ def merge_buffers(meshes):
     return MeshBuffers(vertex_count, index_count, files)
 
 
-def collect_parts(context):
+def collect_parts(context, full_mesh=False, field_log=None):
     objects = sorted((obj for obj in context.selected_objects if obj.type == "MESH"), key=lambda obj: obj.name)
     if not objects:
         raise DumpError("Select one or more imported APMI meshes")
@@ -241,15 +316,35 @@ def collect_parts(context):
             part_key = log, dump.component_key(draw, component.skinning)
             if runtime_key not in groups:
                 groups[runtime_key] = part_key, component, []
-            assigned_key, grouped_component, buffers = groups[runtime_key]
+            assigned_key, _, group = groups[runtime_key]
             if assigned_key != part_key:
                 raise DumpError("The selection includes two source components with the same draw match")
-            buffers.append(encode_mesh(obj, depsgraph, grouped_component))
+            group.append(obj)
         except (KeyError, ValueError, OSError, TypeError, RuntimeError, np.linalg.LinAlgError) as error:
             raise DumpError(f"{obj.name}: {error}") from error
 
-    parts = sorted(groups.values(), key=lambda entry: (entry[1].draw.call, entry[1].ib))
-    return [(part, merge_buffers(buffers)) for _, part, buffers in parts]
+    parts, variants = [], []
+    for (log, _), component, group in sorted(groups.values(), key=lambda entry: (entry[1].draw.call, entry[1].ib)):
+        source = None
+        if len(group) == 1 and not full_mesh:
+            try:
+                source = dumps[log].decode_part(component.draw, component.skinning, True, True)
+            except (KeyError, ValueError, OSError):
+                pass
+        buffers = []
+        for obj in group:
+            try:
+                buffers.append(encode_mesh(obj, depsgraph, component, source))
+            except (KeyError, ValueError, OSError, TypeError, RuntimeError, np.linalg.LinAlgError) as error:
+                raise DumpError(f"{obj.name}: {error}") from error
+        combined = buffers[0] if len(buffers) == 1 else merge_buffers(buffers)
+        parts.append((component, combined))
+        if "Blend" in combined.files:
+            variants.append((log, component, combined))
+    if field_log is not None and variants:
+        field_dump = FrameDump(field_log)
+        add_variants(dumps, field_dump, field_draws(field_dump), variants)
+    return parts
 
 
 class APMI_OT_export_mod(bpy.types.Operator, ExportHelper, ExportOptions):
@@ -276,9 +371,14 @@ class APMI_OT_export_mod(bpy.types.Operator, ExportHelper, ExportOptions):
     def execute(self, context):
         try:
             target = output_target(bpy.path.abspath(self.filepath))
-            parts = collect_parts(context)
+            field_log = Path(bpy.path.abspath(self.field_log)).resolve(strict=True) if self.field_log else None
+            parts = collect_parts(context, self.full_mesh, field_log)
             folder = Path(bpy.path.abspath(self.dds_folder)) if self.dds_folder else None
             replacements, ignored = replacement_textures(folder, [part for part, _ in parts])
+            parts = [
+                (part, buffers) for part, buffers in parts
+                if buffers.files or part.textures.keys() & replacements.keys()
+            ]
             write_mod(target, parts, replacements, self.overwrite)
         except (ValueError, OSError, KeyError) as error:
             self.report({"ERROR"}, str(error))
@@ -286,6 +386,13 @@ class APMI_OT_export_mod(bpy.types.Operator, ExportHelper, ExportOptions):
         if ignored:
             print("APMI-Tools: no matching source texture for " + ", ".join(ignored))
             self.report({"WARNING"}, f"Ignored {len(ignored)} DDS files with no source hash match")
+        warnings = [f"{part.ib}: {buffers.variant_warning}" for part, buffers in parts if buffers.variant_warning]
+        if warnings:
+            for warning in warnings:
+                print(f"APMI-Tools: {warning}")
+            self.report({"WARNING"}, "Some draws use the original mesh for " + ", ".join(
+                part.ib for part, buffers in parts if buffers.variant_warning
+            ))
         self.report({"INFO"}, f"Exported {len(parts)} APMI components and {len(replacements)} DDS files")
         return {"FINISHED"}
 

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "APMI-Tools",
     "description": "Import APMI Frame Analysis meshes and export APMI mods",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (5, 2, 0),
     "location": "3D Viewport > Sidebar > APMI Tools",
     "category": "Import-Export",
@@ -11,7 +11,7 @@ if "bpy" in locals():
     from importlib import reload
     from sys import modules
 
-    for name in ("frame_dump", "options", "mod_export", "blender_export", "sidebar"):
+    for name in ("frame_dump", "options", "skinning_variants", "mod_export", "blender_export", "sidebar"):
         if (module := modules.get(f"{__name__}.{name}")) is not None:
             reload(module)
 

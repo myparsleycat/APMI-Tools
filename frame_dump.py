@@ -16,7 +16,7 @@ ARGUMENT = re.compile(r"(\w+):(-?\d+)(?=,|$)")
 BINDING = re.compile(r"^\s+(\d+): .*?\bresource=(0x[0-9a-fA-F]+)")
 REDIRECT = re.compile(r"^\d+ 3DMigoto .*?Dumping .*? (.+?) -> (.+)$")
 RESOURCE_NAME = re.compile(
-    r"^(\d+)-(ib|vb\d+|u0|cs-t[0-2]|ps-t\d+)=([^-]+)(-.*)?\.(buf|txt|dds)$",
+    r"^(\d+)-(ib|vb\d+|u0|cs-t[0-2]|vs-cb1|ps-t\d+)=([^-]+)(-.*)?\.(buf|txt|dds)$",
     re.IGNORECASE,
 )
 INDEX_FORMATS = {"R16_UINT": "<u2", "R32_UINT": "<u4"}

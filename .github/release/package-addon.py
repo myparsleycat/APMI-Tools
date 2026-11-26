@@ -44,6 +44,9 @@ def main(version, output):
         "mod_export.py",
         "options.py",
         "sidebar.py",
+        "skinning_variants.py",
+        "LICENSE",
+        "UPSTREAM.md",
     )
     with ZipFile(output, "w", compression=ZIP_DEFLATED) as archive:
         for name in addon_files:

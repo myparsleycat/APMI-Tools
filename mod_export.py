@@ -14,6 +14,7 @@ from .frame_dump import COLOR_FORMAT, UV_FORMATS, Draw, DumpError, Skinning, rea
 
 
 CORE = "\\APMIv1\\"
+ACTOR_FIELDS = ("x", "y", "z", "facing_x", "facing_z")
 MANIFEST = "apmi-tools.json"
 FILE_PREFIX = "DISABLED_APMI_"
 ATTRIBUTE_FORMATS = {name: (np.dtype(dtype), 2) for name, dtype in UV_FORMATS.items()}
@@ -59,6 +60,8 @@ class MeshBuffers:
     vertices: int
     indices: int
     files: dict[str, bytes | bytearray]
+    variants: dict | None = None
+    variant_warning: str = ""
 
 
 def get_component(dump, call):
@@ -180,9 +183,135 @@ def replacement_textures(folder, components):
     return replacements, ignored
 
 
+def profile_condition(profile, prefix):
+    return (
+        f"${CORE}{prefix}_blend_hi == {int(profile.blend_hash[:4], 16)}"
+        f" && ${CORE}{prefix}_blend_lo == {int(profile.blend_hash[4:], 16)}"
+        f" && ${CORE}{prefix}_format == {profile.bones * 8 + profile.influences}"
+    )
+
+
+def donor_sections(donor, number, collect):
+    ib, first, count, base = donor.component
+    name = f"Donor{number}"
+    actor = f"${CORE}actor_key"
+    commands = [
+        f"[TextureOverride{name}]",
+        f"hash = {ib}",
+        f"match_first_index = {first}",
+        f"match_index_count = {count}",
+        f"match_first_vertex = {base & 0xffffffff}",
+        "match_priority = -100",
+        "if $mod_id > 0 && (DRAW_TYPE == 2 || (DRAW_TYPE == 4 && INSTANCE_COUNT == 1))",
+        f"    run = CommandList{CORE}ReadSkinActor",
+        f"    if {actor} > 0 && ({profile_condition(donor.profile, 'actor')})",
+        f"        run = CommandList{CORE}RecordSkinActor",
+    ]
+    sections = []
+    for parity in (0, 1):
+        pool = f"Pool{name}{parity}"
+        owner = f"Pool{name}Output{parity}"
+        fields = [(f"Pool{name}{field}{parity}", f"${CORE}actor_{field}") for field in ACTOR_FIELDS]
+        palette_flags = ("\npool_element_type_switch_reset = 0\ntype = StructuredBuffer\n"
+                         "stride = 64\nbind_flags = shader_resource") if collect else ""
+        for resource in (pool, owner, *(field for field, _ in fields)):
+            sections.append(f"[{resource}]\npool_size = 64\npool_index_type = fifo"
+                            + (palette_flags if resource == pool else ""))
+        conflicts = [f"${owner}[{actor}] != @vb0",
+                     *(f"${field}[{actor}] != {value}" for field, value in fields)]
+        commands.extend([
+            f"        if FRAME_NUMBER % 2 == {parity}",
+            f"            if ${pool}[{actor}] == FRAME_NUMBER + 1",
+            f"                if {' || '.join(conflicts)}",
+            f"                    ${pool}[{actor}] = -(FRAME_NUMBER + 1)",
+            "                endif",
+            f"            elif ${pool}[{actor}] != -(FRAME_NUMBER + 1)",
+        ])
+        indent = "                "
+        if collect:
+            commands.extend([
+                f"{indent}{pool}[{actor}] = copy Pool{CORE}BoneMatrices[@vb0]",
+                f"{indent}if @{pool}[{actor}]",
+            ])
+            indent += "    "
+        commands.extend([f"{indent}${owner}[{actor}] = @vb0",
+                         *(f"{indent}${field}[{actor}] = {value}" for field, value in fields),
+                         f"{indent}${pool}[{actor}] = FRAME_NUMBER + 1"])
+        if collect:
+            commands.append("                endif")
+        commands.extend(["            endif", "        endif"])
+    return ["\n".join([*commands, "    endif", "endif"]), *sections]
+
+
+def merged_selection(name, variant, receiver, donor_ids):
+    actor = f"${CORE}snapshot_actor"
+    receiver = f"Donor{donor_ids[receiver]}"
+    commands = [
+        f"    if !${CORE}variant_is_previous",
+        f"        run = CommandList{CORE}ReadPreviousSkinActor",
+        f"        if {actor} > 0",
+    ]
+    names = [(f"Donor{donor_ids[donor]}", table) for donor, table in variant.donors]
+    for parity in (0, 1):
+        def snapshot(donor, field):
+            return f"$Pool{donor}{field}{parity}[{actor}]"
+
+        current_actor = " && ".join(
+            f"{snapshot(receiver, field)} == ${CORE}actor_{field}" for field in ACTOR_FIELDS)
+        receiver_checks = [
+            f"{snapshot(receiver, '')} == FRAME_NUMBER",
+            f"{snapshot(receiver, 'Output')} == ${CORE}snapshot_output",
+            f"(${CORE}snapshot_tracks_motion || ({current_actor}))",
+        ]
+        commands.extend([
+            f"            if (FRAME_NUMBER - 1) % 2 == {parity}",
+            f"                local $ready = {' && '.join(receiver_checks)}",
+        ])
+        for donor, _ in names:
+            checks = [f"{snapshot(donor, '')} == FRAME_NUMBER", f"@Pool{donor}{parity}[{actor}]"]
+            if donor != receiver:
+                checks.extend(f"{snapshot(donor, field)} == {snapshot(receiver, field)}" for field in ACTOR_FIELDS)
+            commands.append(f"                $ready = $ready && {' && '.join(checks)}")
+        commands.extend([
+            "                if $ready",
+            f"                    Resource{CORE}GatherDestination = ref Resource{name}MergedPalette",
+        ])
+        for donor, table in names:
+            commands.extend([
+                f"                    Resource{CORE}GatherSource = ref Pool{donor}{parity}[{actor}]",
+                f"                    Resource{CORE}GatherMap = ref Resource{name}{table}",
+                f"                    run = CommandList{CORE}GatherSkinBones",
+            ])
+        commands.extend([
+            f"                    Resource{CORE}VariantPalette = ref Resource{name}MergedPalette",
+            f"                    Resource{CORE}VariantBlend = ref Resource{name}{variant.blend}",
+            "                endif",
+            "            endif",
+        ])
+    return [*commands, "        endif", "    endif"]
+
+
 def render_ini(mod_name, parts, replacements):
+    from .skinning_variants import BoneSource, draw_key
+
     namespace = "APMITools_" + hashlib.sha256(mod_name.casefold().encode("utf-8")).hexdigest()[:16]
+    if not parts:
+        return f"namespace = {namespace}\n"
+
     display_name = mod_name.replace('"', "'")
+    donors = {}
+    variant_hashes = set()
+    for component, buffers in parts:
+        for profile, variant in (buffers.variants or {}).items():
+            variant_hashes.add(profile.blend_hash)
+            if variant.donors:
+                receiver = BoneSource(draw_key(component.ib, component.draw), profile, 0)
+                donors.setdefault(receiver, False)
+            for donor, _ in variant.donors:
+                donors[donor] = True
+                variant_hashes.add(donor.profile.blend_hash)
+    donor_ids = {donor: number for number, donor in enumerate(donors)}
+    required_version = "0.31" if any(buffers.variants is not None for _, buffers in parts) else "0.22"
     sections = [
         f"namespace = {namespace}",
         "[Constants]\nglobal $mod_id = 0\nglobal $replace_textures = 0",
@@ -190,13 +319,25 @@ def render_ini(mod_name, parts, replacements):
         "\n".join([
             "[Present]",
             "if $mod_id == 0",
-            "    $" + CORE + "required_version = 0.22",
+            f"    ${CORE}required_version = {required_version}",
             f"    Resource{CORE}ModName = ref ResourceModName",
             f"    run = CommandList{CORE}RegisterMod",
             f"    $mod_id = ${CORE}mod_id",
             "endif",
         ]),
     ]
+    for blend_hash in sorted(variant_hashes):
+        sections.append("\n".join([
+            f"[TextureOverrideNativeBlend{blend_hash}]",
+            f"hash = {blend_hash}",
+            "match_priority = 0",
+            f"if ${CORE}identify_native_blend",
+            f"    ${CORE}native_blend_hi = {int(blend_hash[:4], 16)}",
+            f"    ${CORE}native_blend_lo = {int(blend_hash[4:], 16)}",
+            "endif",
+        ]))
+    for donor, collect in donors.items():
+        sections.extend(donor_sections(donor, donor_ids[donor], collect))
     texture_slots = set()
     for n, (component, buffers) in enumerate(parts):
         name = f"Part{n:02d}"
@@ -204,28 +345,55 @@ def render_ini(mod_name, parts, replacements):
         draw_types = {4 if entry.instances is not None else 2 for entry in component.passes}
         allow = " || ".join(f"DRAW_TYPE == {kind}" + (" && INSTANCE_COUNT == 1" if kind == 4 else "")
                             for kind in sorted(draw_types))
-        sections.append("\n".join([
+        skin_mesh = "Position" in buffers.files
+        replace_indices = "IB" in buffers.files
+        override = [
             f"[TextureOverride{name}]",
             f"hash = {component.ib}",
             f"match_first_index = {draw.first}",
             f"match_index_count = {draw.count}",
-            f"if $mod_id > 0 && ({allow})",
-            f"    ${CORE}component_id = {n}",
-            f"    ${CORE}gpu_posed = 1",
-            f"    Resource{CORE}Input_Position = ref Resource{name}Position",
-            f"    Resource{CORE}Input_Blend = ref Resource{name}Blend",
-            f"    CommandList{CORE}Callback_Component_DrawCustom = ref CommandListDraw{name}",
-            f"    run = CommandList{CORE}Component_DrawInstances",
-            "endif",
-        ]))
-
-        commands = [
-            f"[CommandListDraw{name}]",
-            f"ib = ref Resource{name}IB",
-            f"vb0 = ref Resource{CORE}Position",
         ]
-        for slot in sorted(component.streams):
-            commands.append(f"vb{slot} = ref Resource{name}VB{slot}")
+        if not skin_mesh or buffers.variants is not None:
+            override.append(f"match_first_vertex = {draw.base & 0xffffffff}")
+        override.append(f"if $mod_id > 0 && ({allow})")
+        if skin_mesh:
+            if buffers.variants is not None:
+                override.extend([
+                    f"    ${CORE}variant_mode = 1",
+                    f"    CommandList{CORE}Callback_SelectSkinVariant = ref CommandListSelect{name}",
+                ])
+                selector = [f"[CommandListSelect{name}]"]
+                for profile, variant in buffers.variants.items():
+                    selector.append("if " + profile_condition(profile, "variant"))
+                    if variant.donors:
+                        sections.append(
+                            f"[Resource{name}MergedPalette]\ntype = StructuredBuffer\nstride = 64\n"
+                            f"array = {variant.bone_count}\nbind_flags = shader_resource unordered_access"
+                        )
+                        receiver = BoneSource(draw_key(component.ib, draw), profile, 0)
+                        selector.extend(merged_selection(name, variant, receiver, donor_ids))
+                    else:
+                        selector.append(f"    Resource{CORE}VariantBlend = ref Resource{name}{variant.blend}")
+                    selector.append("endif")
+                sections.append("\n".join(selector))
+            override.extend([
+                f"    ${CORE}component_id = {n}",
+                f"    ${CORE}gpu_posed = 1",
+                f"    Resource{CORE}Input_Position = ref Resource{name}Position",
+                f"    Resource{CORE}Input_Blend = ref Resource{name}Blend",
+                f"    CommandList{CORE}Callback_Component_DrawCustom = ref CommandListDraw{name}",
+                f"    run = CommandList{CORE}Component_DrawInstances",
+            ])
+        else:
+            override.extend(["    handling = skip", f"    run = CommandListDraw{name}"])
+        sections.append("\n".join([*override, "endif"]))
+
+        commands = [f"[CommandListDraw{name}]"]
+        if replace_indices:
+            commands.append(f"ib = ref Resource{name}IB")
+        if skin_mesh:
+            commands.append(f"vb0 = ref Resource{CORE}Position")
+            commands.extend(f"vb{slot} = ref Resource{name}VB{slot}" for slot in sorted(component.streams))
         bindings = sorted({slot for texture_hash, (_, slots) in component.textures.items()
                            if texture_hash in replacements for slot in slots})
         texture_slots.update(bindings)
@@ -234,14 +402,16 @@ def render_ini(mod_name, parts, replacements):
             commands.append("$replace_textures = 1")
             commands.extend(f"checktextureoverride = ps-t{slot}" for slot in bindings)
             commands.append("$replace_textures = 0")
+        first = 0 if replace_indices else draw.first
+        base = 0 if skin_mesh else draw.base
+        indexed = f"drawindexed = {buffers.indices}, {first}, {base}"
+        instanced = f"drawindexedinstanced = {buffers.indices}, INSTANCE_COUNT, {first}, {base}, FIRST_INSTANCE"
         if draw_types == {4}:
-            commands.append(f"drawindexedinstanced = {buffers.indices}, INSTANCE_COUNT, 0, 0, FIRST_INSTANCE")
+            commands.append(instanced)
         elif draw_types == {2, 4}:
-            commands.extend(["if DRAW_TYPE == 4",
-                             f"    drawindexedinstanced = {buffers.indices}, INSTANCE_COUNT, 0, 0, FIRST_INSTANCE",
-                             "else", f"    drawindexed = {buffers.indices}, 0, 0", "endif"])
+            commands.extend(["if DRAW_TYPE == 4", f"    {instanced}", "else", f"    {indexed}", "endif"])
         else:
-            commands.append(f"drawindexed = {buffers.indices}, 0, 0")
+            commands.append(indexed)
         commands.extend(f"ps-t{slot} = ref ResourceSavedPST{slot}" for slot in bindings)
         commands.extend(f"ResourceSavedPST{slot} = null" for slot in bindings)
         sections.append("\n".join(commands))
@@ -250,10 +420,14 @@ def render_ini(mod_name, parts, replacements):
             "IB": "type = Buffer\nformat = DXGI_FORMAT_R32_UINT\nbind_flags = index_buffer",
             "Position": "type = ByteAddressBuffer\nformat = DXGI_FORMAT_R32_TYPELESS\nbind_flags = shader_resource",
             "Blend": "type = ByteAddressBuffer\nformat = DXGI_FORMAT_R32_TYPELESS\nbind_flags = shader_resource",
+            "BlendField": "type = ByteAddressBuffer\nformat = DXGI_FORMAT_R32_TYPELESS\nbind_flags = shader_resource",
+            **{key: "type = StructuredBuffer\nstride = 8\nbind_flags = shader_resource"
+               for key in buffers.files if key.startswith("BoneMap")},
             **{f"VB{slot}": f"type = Buffer\nstride = {stride}\nbind_flags = vertex_buffer"
                for slot, (stride, _) in component.streams.items()},
         }.items():
-            sections.append(f"[Resource{name}{buffer}]\n{config}\nfilename = Buffers/{name}{buffer}.buf")
+            if buffer in buffers.files:
+                sections.append(f"[Resource{name}{buffer}]\n{config}\nfilename = Buffers/{name}{buffer}.buf")
 
     sections.extend(f"[ResourceSavedPST{slot}]" for slot in sorted(texture_slots))
     for texture_hash in sorted(replacements):
