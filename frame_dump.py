@@ -5,10 +5,15 @@ from pathlib import Path
 import numpy as np
 
 
+# The value is the skin profile tag: the fixed influence count, or VARIABLE_INFLUENCES for a
+# blend buffer with a per-vertex offset table. Core stores bones * 8 + tag, so a tag must be below 8.
+VARIABLE_INFLUENCES = 3
+MAX_INFLUENCES = 8
 SKINNING_SHADERS = {
     "3b4f1b1749cd3030": 1,
     "10749e66a6e6de89": 2,
     "09d91b2eee7e232f": 4,
+    "38cddb8c0126726a": VARIABLE_INFLUENCES,
 }
 POSITION_STRIDE = 40
 CALL = re.compile(r"^(\d+) (\w+)\(([^)]*)\)")
@@ -130,6 +135,28 @@ def rows(path, stride, offset, dtype, width, ids):
     return view[ids]
 
 
+def variable_rows(path, vertices, ids):
+    # Layout: (vertices + 1) uint32 offsets in uint32 units, then one uint32 per influence
+    # holding the palette index in the low 16 bits and a UNORM16 weight in the high 16 bits.
+    data = np.fromfile(path, dtype="<u4")
+    if len(data) <= vertices:
+        raise DumpError("Unexpected cs-t1 blend buffer size")
+    offsets = data[:vertices + 1].astype(np.int64)
+    if offsets[0] != vertices + 1:
+        raise DumpError("cs-t1 vertex count does not match cs-t0")
+    spans = np.diff(offsets)
+    if offsets[-1] != len(data) or np.any(spans < 1) or np.any(spans > MAX_INFLUENCES):
+        raise DumpError("Invalid cs-t1 influence offsets")
+    if int(ids[-1]) >= vertices:
+        raise DumpError(f"Vertex indices exceed {path.name}")
+    slots = np.arange(MAX_INFLUENCES)
+    active = slots < spans[ids][:, None]
+    packed = np.zeros((len(ids), MAX_INFLUENCES), dtype=np.uint32)
+    packed[active] = data[(offsets[ids][:, None] + slots)[active]]
+    weights = (packed >> 16).astype(np.float32) / np.float32(65535)
+    return weights, packed & 0xFFFF
+
+
 def parse_filter(value):
     calls, hashes = set(), set()
     for token in re.split(r"[,;\s]+", value.strip().lower()):
@@ -149,6 +176,7 @@ class FrameDump:
         self.root = log.parent
         self.resources = {}
         self.draws = []
+        self.unsupported = []
         self.indexed_draws = {}
         self.read_log(log)
 
@@ -216,17 +244,26 @@ class FrameDump:
                 shader = re.search(r"-cs=([0-9a-f]{16})$", output.shaders) if output else None
                 if address:
                     by_address.pop(address, None)
-                if not shader or shader[1] not in SKINNING_SHADERS:
+                if not shader:
                     continue
-                skinning = Skinning(call, SKINNING_SHADERS[shader[1]], *(
-                    slots.get((slot, "buf")) for slot in ("cs-t0", "cs-t1", "cs-t2")
-                ))
+                if shader[1] in SKINNING_SHADERS:
+                    skinning = Skinning(call, SKINNING_SHADERS[shader[1]], *(
+                        slots.get((slot, "buf")) for slot in ("cs-t0", "cs-t1", "cs-t2")
+                    ))
+                    by_file[output.path] = skinning
+                elif ("cs-t2", "buf") in slots:
+                    # A bone palette marks an unknown skinning shader rather than another compute pass.
+                    skinning = shader[1]
+                    by_file.setdefault(output.path, skinning)
+                else:
+                    continue
                 if address:
                     by_address[address] = skinning
-                by_file[output.path] = skinning
             elif (vertex := slots.get(("vb0", "buf"))) and ("ib", "buf") in slots:
                 skinning = by_address.get(address) if address else by_file.get(vertex.path)
-                if skinning:
+                if isinstance(skinning, str):
+                    self.unsupported.append((draw, skinning))
+                elif skinning:
                     self.draws.append((draw, skinning))
 
     def decode_part(self, draw, skinning, pre_skinning, import_weights):
@@ -309,14 +346,19 @@ class FrameDump:
         if not blend or not rest:
             raise DumpError("Missing cs-t0 or cs-t1 buffer for vertex weights")
         count = skinning.influence_count
-        stride = 4 if count == 1 else count * 8
         positions_size = rest.path.stat().st_size
-        if positions_size % POSITION_STRIDE or blend.path.stat().st_size != positions_size // POSITION_STRIDE * stride:
-            raise DumpError("Unexpected cs-t1 blend buffer size")
-        bones = rows(blend.path, stride, 0 if count == 1 else count * 4, "<u4", count, ids)
-        weights = np.ones(bones.shape, dtype=np.float32) if count == 1 else rows(
-            blend.path, stride, 0, "<f4", count, ids
-        )
+        if positions_size % POSITION_STRIDE:
+            raise DumpError("Unexpected cs-t0 position buffer size")
+        if count == VARIABLE_INFLUENCES:
+            weights, bones = variable_rows(blend.path, positions_size // POSITION_STRIDE, ids)
+        else:
+            stride = 4 if count == 1 else count * 8
+            if blend.path.stat().st_size != positions_size // POSITION_STRIDE * stride:
+                raise DumpError("Unexpected cs-t1 blend buffer size")
+            bones = rows(blend.path, stride, 0 if count == 1 else count * 4, "<u4", count, ids)
+            weights = np.ones(bones.shape, dtype=np.float32) if count == 1 else rows(
+                blend.path, stride, 0, "<f4", count, ids
+            )
         active = weights > 0
         if (
             not np.isfinite(weights).all() or np.any(weights < 0) or np.any(weights > 1.00001)
@@ -335,7 +377,14 @@ class FrameDump:
 
     def parts(self, pre_skinning, import_weights, include_without_uv, draw_filter, import_textures):
         calls, hashes = parse_filter(draw_filter)
-        groups, errors = {}, []
+        groups, errors, reported = {}, [], set()
+        for draw, shader in self.unsupported:
+            ib = self.resources[draw.call]["ib", "buf"].hash
+            key = ib, draw.first, draw.count, shader
+            if ((calls or hashes) and draw.call not in calls and ib not in hashes) or key in reported:
+                continue
+            reported.add(key)
+            errors.append(f"{draw.call:06d}: Unsupported skinning shader {shader} for IB {ib}")
         for draw, skinning in self.draws:
             slots = self.resources[draw.call]
             if (calls or hashes) and draw.call not in calls and slots["ib", "buf"].hash not in hashes:

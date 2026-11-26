@@ -16,7 +16,7 @@ from .mod_export import (
     write_mod,
 )
 from .options import ExportOptions, draw_export_options
-from .skinning_variants import BLEND, add_variants, field_draws
+from .skinning_variants import BLEND, add_variants, blend_dtype, field_draws
 
 
 BONE_GROUP = re.compile(r"Bone (\d+)")
@@ -38,14 +38,15 @@ def game_axes(vectors):
     return vectors[:, [0, 2, 1]] * [1, 1, -1]
 
 
-def blend_data(obj, mesh, ids, palette_size):
+def blend_data(obj, mesh, ids, palette_size, dtype=BLEND):
+    limit = dtype["weights"].shape[0]
     groups = {}
     for group in obj.vertex_groups:
         match = BONE_GROUP.fullmatch(group.name)
         if match:
             groups[group.index] = int(match[1])
 
-    blend = np.zeros(len(mesh.vertices), dtype=BLEND)
+    blend = np.zeros(len(mesh.vertices), dtype=dtype)
     for vertex_id in np.unique(ids):
         weights = {}
         for element in mesh.vertices[int(vertex_id)].groups:
@@ -56,8 +57,8 @@ def blend_data(obj, mesh, ids, palette_size):
             if bone >= palette_size or not np.isfinite(weight) or weight < 0:
                 raise DumpError(f"Vertex {vertex_id} has an invalid bone index or weight")
             weights[bone] = weights.get(bone, 0.0) + weight
-        if not weights or len(weights) > 4:
-            raise DumpError(f"Vertex {vertex_id} must have weights for one to four Bone groups")
+        if not weights or len(weights) > limit:
+            raise DumpError(f"Vertex {vertex_id} must have weights for one to {limit} Bone groups")
         total = sum(weights.values())
         for column, (bone, weight) in enumerate(sorted(weights.items(), key=lambda item: (-item[1], item[0]))):
             blend["weights"][vertex_id, column] = weight / total
@@ -245,7 +246,7 @@ def encode_mesh(obj, depsgraph, component, source=None):
         uv0 = texture_coordinates(mesh, 0)
         if uv0 is None:
             raise DumpError("Missing UV map TEXCOORD0")
-        blend = blend_data(obj, mesh, ids, bone_count)
+        blend = blend_data(obj, mesh, ids, bone_count, blend_dtype(component.skinning.influence_count))
         if source is not None:
             original = encode_original_indices(mesh, loops, ids, triangles, matrix, source, blend)
             if original is not None:

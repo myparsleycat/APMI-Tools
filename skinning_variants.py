@@ -2,10 +2,11 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .frame_dump import DumpError
+from .frame_dump import MAX_INFLUENCES, VARIABLE_INFLUENCES, DumpError
 
 
 BLEND = np.dtype([("weights", "<f4", 4), ("indices", "<u4", 4)])
+BLEND8 = np.dtype([("weights", "<f4", MAX_INFLUENCES), ("indices", "<u4", MAX_INFLUENCES)])
 WEIGHT_TOLERANCE = 2e-5
 POSE_TOLERANCE = 1e-4
 
@@ -41,6 +42,10 @@ class Variant:
     blend: str
     donors: tuple[tuple[BoneSource, str], ...] = ()
     bone_count: int = 0
+
+
+def blend_dtype(influences):
+    return BLEND8 if influences == VARIABLE_INFLUENCES else BLEND
 
 
 def draw_key(ib_hash, draw):
@@ -130,9 +135,9 @@ def original_pair(reference_dump, field_dump, source, target):
     return reference, reference_profile, field_profile, mapping if verified else {}
 
 
-def remap_blend(data, mapping):
+def remap_blend(data, mapping, dtype):
     # Adapted from EFMI-Tools build_lod_buffers (eaa9036), GPL-3.0.
-    blend = np.frombuffer(data, dtype=BLEND).copy()
+    blend = np.frombuffer(data, dtype=dtype).copy()
     active = blend["weights"] > 0
     used = np.unique(blend["indices"][active])
     missing = [int(bone) for bone in used if int(bone) not in mapping]
@@ -193,7 +198,8 @@ def donor_catalog(reference_dump, field_dump, targets, reference, target):
 
 def merged_variant(buffers, reference, profile, mapping, donors):
     # Adapted from EFMI-Tools build_merged_skeleton_vg_map (eaa9036), GPL-3.0.
-    used_blend = np.frombuffer(buffers.files["Blend"], dtype=BLEND)
+    dtype = blend_dtype(reference.skinning.influence_count)
+    used_blend = np.frombuffer(buffers.files["Blend"], dtype=dtype)
     used_bones = np.unique(used_blend["indices"][used_blend["weights"] > 0])
     reference_matrices = palette(reference)
     sources, missing = {}, []
@@ -219,7 +225,7 @@ def merged_variant(buffers, reference, profile, mapping, donors):
         return None, missing
 
     compact = {bone: index for index, bone in enumerate(sources)}
-    data, _ = remap_blend(buffers.files["Blend"], compact)
+    data, _ = remap_blend(buffers.files["Blend"], compact, dtype)
     buffers.files["BlendField"] = data
     groups = {}
     for bone, source in sources.items():
@@ -254,7 +260,7 @@ def add_variants(dumps, field_dump, targets, parts):
                 buffers.variants.pop(profile)
             continue
 
-        data, missing = remap_blend(buffers.files["Blend"], mapping)
+        data, missing = remap_blend(buffers.files["Blend"], mapping, blend_dtype(profile.influences))
         if field_profile == profile:
             if data != buffers.files["Blend"]:
                 buffers.variants.pop(profile)

@@ -10,7 +10,7 @@ from tempfile import mkdtemp
 
 import numpy as np
 
-from .frame_dump import COLOR_FORMAT, UV_FORMATS, Draw, DumpError, Skinning, read_header
+from .frame_dump import COLOR_FORMAT, UV_FORMATS, VARIABLE_INFLUENCES, Draw, DumpError, Skinning, read_header
 
 
 CORE = "\\APMIv1\\"
@@ -311,7 +311,18 @@ def render_ini(mod_name, parts, replacements):
                 donors[donor] = True
                 variant_hashes.add(donor.profile.blend_hash)
     donor_ids = {donor: number for number, donor in enumerate(donors)}
-    required_version = "0.31" if any(buffers.variants is not None for _, buffers in parts) else "0.22"
+    profiles = {donor.profile.influences for donor in donors} | {
+        profile.influences for _, buffers in parts for profile in (buffers.variants or {})
+    }
+    if VARIABLE_INFLUENCES in profiles or any(
+        "Blend" in buffers.files and component.skinning.influence_count == VARIABLE_INFLUENCES
+        for component, buffers in parts
+    ):
+        required_version = "0.32"
+    elif any(buffers.variants is not None for _, buffers in parts):
+        required_version = "0.31"
+    else:
+        required_version = "0.22"
     sections = [
         f"namespace = {namespace}",
         "[Constants]\nglobal $mod_id = 0\nglobal $replace_textures = 0",
