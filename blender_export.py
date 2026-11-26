@@ -6,7 +6,7 @@ import bpy
 import numpy as np
 from bpy_extras.io_utils import ExportHelper
 
-from .frame_dump import DumpError, FrameDump
+from .frame_dump import DumpError, FrameDump, frame_log
 from .mod_export import (
     ATTRIBUTE_FORMATS,
     MeshBuffers,
@@ -371,7 +371,7 @@ class APMI_OT_export_mod(bpy.types.Operator, ExportHelper, ExportOptions):
     def execute(self, context):
         try:
             target = output_target(bpy.path.abspath(self.filepath))
-            field_log = Path(bpy.path.abspath(self.field_log)).resolve(strict=True) if self.field_log else None
+            field_log = frame_log(bpy.path.abspath(self.field_capture)) if self.field_capture.strip() else None
             parts = collect_parts(context, self.full_mesh, field_log)
             folder = Path(bpy.path.abspath(self.dds_folder)) if self.dds_folder else None
             replacements, ignored = replacement_textures(folder, [part for part, _ in parts])

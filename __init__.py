@@ -15,7 +15,6 @@ if "bpy" in locals():
         if (module := modules.get(f"{__name__}.{name}")) is not None:
             reload(module)
 
-from pathlib import Path
 
 import bpy
 import numpy as np
@@ -23,7 +22,7 @@ from bpy.props import StringProperty
 from bpy_extras.io_utils import ImportHelper
 
 from .blender_export import APMI_OT_export_mod, menu_export
-from .frame_dump import DumpError, FrameDump
+from .frame_dump import DumpError, FrameDump, frame_log
 from .options import ImportOptions, draw_import_options
 from . import sidebar
 
@@ -115,13 +114,8 @@ class APMI_OT_import_frame_analysis(bpy.types.Operator, ImportHelper, ImportOpti
         draw_import_options(self.layout, self)
 
     def execute(self, context):
-        log = Path(bpy.path.abspath(self.filepath))
-        if log.is_dir():
-            log /= "log.txt"
-        if not log.is_file() or log.name.lower() != "log.txt":
-            self.report({"ERROR"}, "Select the Frame Analysis log.txt")
-            return {"CANCELLED"}
         try:
+            log = frame_log(bpy.path.abspath(self.filepath))
             dump = FrameDump(log)
             parts, warnings = dump.parts(
                 self.pose == "PRE_SKINNING", self.import_weights, self.include_without_uv,

@@ -28,6 +28,14 @@ class DumpError(ValueError):
     pass
 
 
+def frame_log(path):
+    path = Path(path)
+    log = path / "log.txt" if path.is_dir() else path
+    if not log.is_file() or log.name.lower() != "log.txt":
+        raise DumpError(f"No Frame Analysis log.txt in {path}")
+    return log.resolve()
+
+
 @dataclass(frozen=True)
 class Resource:
     hash: str

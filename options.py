@@ -34,10 +34,10 @@ class ImportOptions:
 
 
 class ExportOptions:
-    field_log: StringProperty(
-        name="Field Frame Analysis Log",
-        description="Match a field capture to the source meshes for full mesh export",
-        subtype="FILE_PATH",
+    field_capture: StringProperty(
+        name="Field Frame Analysis",
+        description="Frame Analysis folder captured in the field, used to map bone palettes for full mesh export",
+        subtype="DIR_PATH",
     )
     full_mesh: BoolProperty(
         name="Export Full Mesh",
@@ -67,7 +67,7 @@ def draw_import_options(layout, settings):
 
 
 def draw_export_options(layout, settings):
-    layout.prop(settings, "field_log")
+    layout.prop(settings, "field_capture")
     layout.prop(settings, "full_mesh")
     layout.prop(settings, "dds_folder")
     layout.prop(settings, "overwrite")
