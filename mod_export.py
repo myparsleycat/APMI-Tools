@@ -215,7 +215,7 @@ def donor_sections(donor, number, collect):
         palette_flags = ("\npool_element_type_switch_reset = 0\ntype = StructuredBuffer\n"
                          "stride = 64\nbind_flags = shader_resource") if collect else ""
         for resource in (pool, owner, *(field for field, _ in fields)):
-            sections.append(f"[{resource}]\npool_size = 64\npool_index_type = fifo"
+            sections.append(f"[{resource}]\npool_size = 64\npool_index_type = fifo\npool_expiration_timeout_frames = 2"
                             + (palette_flags if resource == pool else ""))
         conflicts = [f"${owner}[{actor}] != @vb0",
                      *(f"${field}[{actor}] != {value}" for field, value in fields)]
