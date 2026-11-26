@@ -1,0 +1,29 @@
+name: Draft Release
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: draft-release
+  cancel-in-progress: false
+
+jobs:
+  draft:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install release dependencies
+        run: npm ci --prefix .github/release
+      - name: Create draft release
+        run: node .github/release/draft-release.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

@@ -1,0 +1,8 @@
+{
+  "name": "apmi-tools-release",
+  "private": true,
+  "devDependencies": {
+    "conventional-changelog-conventionalcommits": "9.3.0",
+    "semantic-release": "25.0.3"
+  }
+}
