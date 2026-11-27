@@ -13,17 +13,37 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           package-manager-cache: false
       - name: Install release dependencies
         run: npm ci --prefix .github/release
-      - name: Create draft release
-        run: node .github/release/draft-release.mjs
+      - name: Build release package
+        id: plan
+        run: node .github/release/draft-release.mjs plan
         env:
           GITHUB_TOKEN: ${{ github.token }}
+      # Attesting the version file binds the package to this release, so an older attested package cannot be
+      # republished under a newer tag.
+      - name: Attest release package
+        id: attest
+        if: steps.plan.outputs.version != ''
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            ${{ steps.plan.outputs.archive }}
+            ${{ steps.plan.outputs.version-file }}
+      - name: Create draft release
+        if: steps.plan.outputs.version != ''
+        run: node .github/release/draft-release.mjs publish
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.plan.outputs.version }}
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
